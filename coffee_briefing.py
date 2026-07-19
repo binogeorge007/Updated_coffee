@@ -2,17 +2,17 @@
 Daily coffee market briefing - cloud version.
 
 Fetches Karnataka local prices (Kirehalli), ICE Arabica/Robusta benchmarks
-(Trading Economics), and AUD/INR + USD/INR rates (xe.com), appends a row per
-grade to a Google Sheet, computes a tracked-history high/low + buy/wait signal
-per variety, and sends the result over Telegram and email.
+(Trading Economics), and AUD/INR + USD/INR rates (Frankfurter), appends a row
+per grade to a Google Sheet, computes a tracked-history high/low + buy/wait
+signal per variety, and renders a static dashboard.
 
 Designed to run unattended on GitHub Actions - no local machine required.
 
 CAVEATS - read before relying on this:
-  - Kirehalli/Trading Economics/xe.com are scraped with regex/BeautifulSoup.
-    They provide no stable API and can change their HTML at any time, which
-    will silently break parsing here. Check the Action's run logs after the
-    first few runs.
+  - Kirehalli/Trading Economics are scraped with regex/BeautifulSoup. They
+    provide no stable API and can change their HTML at any time, which will
+    silently break parsing here. Check the Action's run logs after the first
+    few runs.
   - Nothing here fabricates a number: if a fetch fails, that field is recorded
     as None / "N/A" and flagged in the message rather than guessed.
   - Brazil and PNG landed-cost figures use the same ICE NY Arabica benchmark
@@ -28,14 +28,6 @@ Required environment variables (set as GitHub Secrets, injected via
   GOOGLE_SERVICE_ACCOUNT_JSON  - full JSON key content for a Google Cloud
                                  service account with Sheets API access
   GOOGLE_SHEET_ID              - the target spreadsheet's ID (from its URL)
-  TELEGRAM_BOT_TOKEN           - from @BotFather
-  TELEGRAM_CHAT_ID             - your chat/user/group ID
-  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_TO
-                                - SMTP creds for outbound email (e.g. Gmail
-                                  with an App Password, or any SMTP provider)
-
-Any of the notification blocks (Telegram / email) are skipped gracefully if
-their env vars aren't set, so you can enable just one if you prefer.
 """
 import os
 import re
@@ -49,6 +41,11 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+# A normal browser User-Agent, not a self-identifying bot string. Small
+# WordPress sites (like Kirehalli) commonly run security plugins that block
+# any request whose User-Agent contains "bot" - the previous
+# "CoffeeBriefingBot/1.0" string was plausibly getting silently blocked,
+# which would explain every local-price field coming back N/A.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -83,20 +80,11 @@ GRADES = [
     ("Robusta", "Cherry (RC)"),
 ]
 
-# Milling outturn ratios: how much clean/green bean weight comes out of a kg
-# of dried parchment or cherry. These are industry rule-of-thumb figures used
-# by Indian curers/exporters and in Coffee Board of India crop-estimation
-# methodology - NOT a lab-measured figure for any specific lot. Actual outturn
-# varies (+/- ~5 points) with bean moisture, size, and processing quality.
-# I could not pull a single authoritative numeric citation via live web fetch
-# this session (several Indian coffee-trade/government pages returned empty),
-# so treat these as reasonable industry estimates - ask your curer for their
-# actual outturn percentage if you need a precise figure.
 OUTTURN_PCT = {
-    ("Arabica", "Parchment"): 0.80,   # ~1.25 kg parchment -> 1 kg clean
-    ("Arabica", "Cherry"): 0.48,      # ~2.08 kg cherry -> 1 kg clean
-    ("Robusta", "Parchment"): 0.82,   # ~1.22 kg parchment -> 1 kg clean
-    ("Robusta", "Cherry"): 0.50,      # ~2.00 kg cherry -> 1 kg clean
+    ("Arabica", "Parchment"): 0.80,
+    ("Arabica", "Cherry"): 0.48,
+    ("Robusta", "Parchment"): 0.82,
+    ("Robusta", "Cherry"): 0.50,
 }
 
 
@@ -106,24 +94,11 @@ def outturn_pct_for(variety, grade):
 
 
 def milled_equivalent_usd_kg(unmilled_usd_kg, variety, grade):
-    """Converts an unmilled (parchment/cherry weight-basis) USD/kg price into
-    an estimated milled/clean-green-bean-equivalent USD/kg price, so it's
-    comparable on the same weight basis as the global ICE benchmark (which is
-    clean green bean, FOB)."""
     pct = outturn_pct_for(variety, grade)
     return unmilled_usd_kg / pct
 
 
 def market_grade_name(variety, grade):
-    """Indian coffee trade naming: washed (parchment) Arabica is sold as
-    'Plantation' once milled - Plantation A/B/C, PB. Robusta's washed/milled
-    form keeps the name 'Parchment' (no separate 'Plantation' naming for
-    Robusta). Natural/dry-processed coffee - Arabica or Robusta - stays
-    'Cherry' both before and after milling. Kirehalli only ever publishes the
-    raw, unmilled farm-gate/curing-works price (confirmed by checking its
-    live site directly - there's no free public feed for actual traded
-    Plantation-grade prices), so this label is attached to our *estimated*
-    milled-equivalent figure, not a live quote."""
     if variety == "Arabica" and "Parchment" in grade:
         return "Arabica Plantation (estimated milled)"
     if variety == "Arabica":
@@ -132,10 +107,6 @@ def market_grade_name(variety, grade):
         return "Robusta Parchment (estimated milled)"
     return "Robusta Cherry (estimated milled)"
 
-
-# --------------------------------------------------------------------------
-# Fetching (same sources/logic as the local version, regex bug already fixed)
-# --------------------------------------------------------------------------
 
 def http_get(url, timeout=15):
     try:
@@ -149,14 +120,7 @@ def http_get(url, timeout=15):
 
 def fetch_kirehalli():
     """Fetches Kirehalli's latest 'Coffee Prices (Karnataka)' post directly by
-    its dated URL (kirehalli.com/coffee-prices-karnataka-DD-MM-YYYY), which is
-    their actual publishing pattern - sometimes with a -2/-3 suffix if they
-    post a same-day correction/update. Tries today's date (with suffixes)
-    first, then falls back to yesterday's date in case today's post isn't up
-    yet. Does NOT rely on finding a link from an index page - that approach
-    doesn't match how Kirehalli's site is actually structured and silently
-    found nothing. If no post is found at any candidate URL, returns {} and
-    every grade is logged as N/A rather than fabricating a number."""
+    its dated URL (kirehalli.com/coffee-prices-karnataka-DD-MM-YYYY)."""
     today = datetime.date.today()
     candidates = []
     for days_back in (0, 1):
@@ -181,7 +145,6 @@ def fetch_kirehalli():
         return {}
 
     text = BeautifulSoup(post_html, "html.parser").get_text("\n")
-
     result = {"source_url": link}
 
     def find_range(label):
@@ -227,10 +190,7 @@ def fetch_ice_arabica_benchmark():
 def fetch_rate(from_ccy, to_ccy):
     """Uses the Frankfurter API (frankfurter.app - free, no key, ECB reference
     rates), which returns plain JSON. xe.com's converter page is a
-    client-rendered React app: the actual rate number only appears after
-    JavaScript runs in a real browser, so a plain requests.get() never saw it
-    in the raw HTML - the old regex-on-xe.com approach was silently returning
-    None on every single run, not just failing today."""
+    client-rendered React app whose actual rate never appears in raw HTML."""
     html = http_get(f"https://api.frankfurter.app/latest?from={from_ccy}&to={to_ccy}")
     if not html:
         return None
@@ -242,13 +202,8 @@ def fetch_rate(from_ccy, to_ccy):
         print(f"  [warn] could not parse FX response for {from_ccy}->{to_ccy}: {e}")
         return None
 
-# --------------------------------------------------------------------------
-# Google Sheets
-# --------------------------------------------------------------------------
 
 def get_gsheet_client():
-    """Authenticate with a service account. GOOGLE_SERVICE_ACCOUNT_JSON holds
-    the full JSON key content (paste the whole key file as the secret value)."""
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
@@ -294,7 +249,6 @@ def read_assumptions(ws_assump):
 
 
 def read_price_history(ws_log):
-    """Returns list of dicts for every existing row (empty list if sheet is new)."""
     records = ws_log.get_all_records()
     history = []
     for row in records:
@@ -311,10 +265,6 @@ def read_price_history(ws_log):
     return history
 
 
-# --------------------------------------------------------------------------
-# Calculations (Python equivalents of the xlsx formulas from the local version)
-# --------------------------------------------------------------------------
-
 def landed_cost_aud_per_kg(base_price_aud_per_kg, assumptions):
     a = assumptions
     return (base_price_aud_per_kg * (1 + a["customs_pct"])
@@ -323,11 +273,6 @@ def landed_cost_aud_per_kg(base_price_aud_per_kg, assumptions):
 
 
 def india_landed_cost(mid_price_rs_per_50kg, aud_inr, assumptions, variety, grade):
-    """Landed cost is computed off the MILLED-equivalent price, not the raw
-    unmilled parchment/cherry price - what actually gets exported and cleared
-    through customs is milled clean green bean (Plantation/Cherry grade), not
-    raw parchment. Using the raw price here would understate true cost by
-    skipping the milling step entirely."""
     unmilled_aud_per_kg = (mid_price_rs_per_50kg / 50) / aud_inr
     milled_aud_per_kg = unmilled_aud_per_kg / outturn_pct_for(variety, grade)
     return landed_cost_aud_per_kg(milled_aud_per_kg, assumptions)
@@ -351,7 +296,6 @@ def brazil_png_landed_cost_aud_per_kg(ice_arabica_cents_lb, usd_inr, aud_inr, as
 
 
 def tracked_stats(history, variety, grade, today, today_mid_price):
-    """Mirrors the xlsx Tracked High/Low/Range Status/Weeks Tracked formulas."""
     same = [h for h in history if h["variety"] == variety and h["grade"] == grade and h["mid_price"] is not None]
     if not same:
         weeks = 0.0
@@ -376,18 +320,6 @@ def tracked_stats(history, variety, grade, today, today_mid_price):
 
 
 def window_flag(history, variety, grade, today, today_mid_price):
-    """Flags when today's price is at (or beyond) the 3-month or 6-month
-    high/low, computed from the sheet's own accumulated history.
-
-    Green  = at a 3- or 6-month LOW  -> historically cheap, safer to buy.
-    Red    = at a 3- or 6-month HIGH -> historically expensive, riskier to buy.
-    A 6-month extreme implies the 3-month one too (nested window), so the
-    longer window "wins" for the label.
-
-    Honesty note: this only means something once real history has
-    accumulated. With less than ~90/180 days of logged data, "N/A - insufficient
-    history yet" is returned rather than a fabricated flag.
-    """
     same = [h for h in history if h["variety"] == variety and h["grade"] == grade and h["mid_price"] is not None]
     if not same:
         return "N/A - insufficient history yet", "none"
@@ -421,7 +353,6 @@ def window_flag(history, variety, grade, today, today_mid_price):
 
 
 def build_signal(variety, grade_statuses):
-    """grade_statuses: dict of grade -> range status string, for this variety."""
     at_high = any("high" in s for s in grade_statuses.values())
     at_low = any("low" in s and "high" not in s for s in grade_statuses.values())
     month = datetime.date.today().month
@@ -447,20 +378,12 @@ def build_signal(variety, grade_statuses):
     return headline, reasoning
 
 
-# --------------------------------------------------------------------------
-# Notifications
-# --------------------------------------------------------------------------
-
 GREEN_BG = {"red": 0.71, "green": 0.88, "blue": 0.71}
 RED_BG = {"red": 0.96, "green": 0.71, "blue": 0.71}
 FLAG_COL_LETTER = gspread.utils.rowcol_to_a1(1, PRICE_LOG_HEADERS.index("3/6-Month Flag") + 1)[:-1]
 
 
 def color_flag_cells(ws_log, first_new_row, new_rows):
-    """Colors the '3/6-Month Flag' cell green (3/6-month low - safer to buy)
-    or red (3/6-month high - riskier) for each just-appended row, based on
-    the 'Flag Color' value computed alongside it. Leaves the cell unstyled
-    ("none") when there isn't enough history yet or price is mid-range."""
     color_idx = PRICE_LOG_HEADERS.index("Flag Color")
     for i, row in enumerate(new_rows):
         color = row[color_idx]
@@ -473,12 +396,6 @@ def color_flag_cells(ws_log, first_new_row, new_rows):
         except Exception as e:
             print(f"  [warn] could not color-format {cell}: {e}")
 
-
-# --------------------------------------------------------------------------
-# Static HTML dashboard (published to GitHub Pages by the workflow, so the
-# same look as the Cowork artifact is viewable from any device/browser -
-# no Chrome extension, no Cowork session required).
-# --------------------------------------------------------------------------
 
 GRADE_DISPLAY = {
     ("Arabica", "Parchment (AP)"): ("Arabica parchment (AP)", "Plantation", "~80%"),
@@ -538,10 +455,6 @@ def render_dashboard_html(today, grade_data, grade_changes, range_statuses, flag
                            ice_robusta, aud_inr, usd_inr, bench_usd_kg_arabica,
                            bench_usd_kg_robusta, arabica_signal, arabica_reason,
                            robusta_signal, robusta_reason, brazil_png_landed, history):
-    """Renders the same visual layout as the Cowork 'Coffee Buying Dashboard'
-    artifact as a single static HTML file, so it can be published to GitHub
-    Pages and viewed from any device without Chrome or Cowork."""
-
     if history:
         oldest = min(h["date"] for h in history)
         days_tracked = (today - oldest).days
@@ -740,47 +653,6 @@ def render_dashboard_html(today, grade_data, grade_changes, range_statuses, flag
     return html
 
 
-def send_telegram(text):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("  [skip] Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing)")
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=15)
-        resp.raise_for_status()
-        print("  Telegram message sent.")
-    except Exception as e:
-        print(f"  [warn] Telegram send failed: {e}")
-
-
-def send_email(subject, body):
-    host = os.getenv("SMTP_HOST")
-    port = os.getenv("SMTP_PORT")
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASSWORD")
-    to_addr = os.getenv("EMAIL_TO")
-    if not all([host, port, user, password, to_addr]):
-        print("  [skip] Email not configured (SMTP_HOST/PORT/USER/PASSWORD/EMAIL_TO missing)")
-        return
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = to_addr
-    try:
-        with smtplib.SMTP_SSL(host, int(port)) as server:
-            server.login(user, password)
-            server.sendmail(user, [to_addr], msg.as_string())
-        print("  Email sent.")
-    except Exception as e:
-        print(f"  [warn] Email send failed: {e}")
-
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
-
 def main():
     today = datetime.date.today()
     print(f"=== Coffee briefing for {today.isoformat()} ===")
@@ -791,7 +663,7 @@ def main():
     print("Fetching ICE Arabica benchmark (Trading Economics)...")
     ice_arabica_benchmark = fetch_ice_arabica_benchmark()
 
-    print("Fetching AUD/INR and USD/INR (xe.com)...")
+    print("Fetching AUD/INR and USD/INR (Frankfurter)...")
     aud_inr = fetch_rate("AUD", "INR")
     usd_inr = fetch_rate("USD", "INR")
 
@@ -878,88 +750,6 @@ def main():
     bench_usd_kg_arabica = global_benchmark_usd_per_kg("Arabica", ice_arabica, True)
     bench_usd_kg_robusta = global_benchmark_usd_per_kg("Robusta", ice_robusta, False)
 
-    lines = [
-        f"Coffee briefing - {today.isoformat()}",
-        "",
-        "Karnataka local prices (Rs/50kg, raw curing-works price - unmilled):",
-    ]
-    for variety, grade in GRADES:
-        low, high = grade_data[(variety, grade)] or (None, None)
-        chg = grade_changes[(variety, grade)]
-        if low is not None:
-            lines.append(f"  {variety} {grade}: {low:,}-{high:,} ({chg or 'n/a'})")
-        else:
-            lines.append(f"  {variety} {grade}: data unavailable today")
-    lines += [
-        "",
-        f"ICE Arabica (NY): {ice_arabica if ice_arabica else 'N/A'} US cents/lb"
-        f" (~${bench_usd_kg_arabica:.2f}/kg)" if bench_usd_kg_arabica else "",
-        f"ICE Robusta (London): {ice_robusta if ice_robusta else 'N/A'} USD/tonne"
-        f" (~${bench_usd_kg_robusta:.2f}/kg)" if bench_usd_kg_robusta else "",
-        f"AUD/INR: {aud_inr if aud_inr else 'N/A'}   USD/INR: {usd_inr if usd_inr else 'N/A'}",
-        "",
-        f"Arabica signal: {arabica_signal} - {arabica_reason}",
-        f"Robusta signal: {robusta_signal} - {robusta_reason}",
-        "",
-        "3/6-month price flags (green=historically cheap/safer, red=historically expensive/riskier):",
-    ]
-    any_flag = False
-    for variety, grade in GRADES:
-        flag_text, flag_color = flags_by_grade.get((variety, grade), ("N/A", "none"))
-        if flag_color == "green":
-            lines.append(f"  [LOW]  {variety} {grade}: {flag_text}")
-            any_flag = True
-        elif flag_color == "red":
-            lines.append(f"  [HIGH] {variety} {grade}: {flag_text}")
-            any_flag = True
-    if not any_flag:
-        lines.append("  No grade is currently at a 3- or 6-month extreme.")
-
-    lines += [
-        "",
-        "Market grade - estimated milled/clean-bean-equivalent USD/kg (this is what's actually "
-        "comparable to the global benchmark; no free live feed publishes real Plantation-grade "
-        "quotes, so this is Parchment/Cherry converted via industry outturn ratios, not a "
-        "lab-measured figure):",
-    ]
-    for variety, grade in GRADES:
-        milled = milled_by_grade.get((variety, grade))
-        if milled is None:
-            continue
-        bench = bench_usd_kg_arabica if variety == "Arabica" else bench_usd_kg_robusta
-        name = market_grade_name(variety, grade)
-        if bench:
-            lines.append(f"  {name}: ${milled:.2f}/kg (vs global {variety} benchmark ${bench:.2f}/kg)")
-        else:
-            lines.append(f"  {name}: ${milled:.2f}/kg")
-
-    lines += [
-        "",
-        "Estimated AU landed cost (AUD/kg, based on milled-equivalent price - not raw parchment/cherry):",
-    ]
-    for variety, grade in GRADES:
-        landed_val = landed_by_grade.get((variety, grade))
-        if landed_val is not None:
-            lines.append(f"  {market_grade_name(variety, grade)}: ${landed_val:.2f}/kg")
-
-    lines += [
-        "",
-        f"Brazil/PNG landed cost estimate (AUD/kg): {round(brazil_png_landed, 2) if brazil_png_landed else 'N/A'}"
-        " (same ICE NY benchmark for both - no live origin-specific spot price feed)",
-        "",
-        "Reminder: Sydney/Newcastle wholesale rates aren't published anywhere - log real supplier"
-        " quotes in the Google Sheet's manual columns.",
-    ]
-    message = "\n".join(l for l in lines if l is not None)
-    print("\n" + message)
-    # No Telegram/email - dashboard only, per preference. send_telegram()/
-    # send_email() are still defined above and still no-op safely if their
-    # secrets aren't set, but main() deliberately never calls them.
-
-    # Render the same visual dashboard as the Cowork artifact to a static
-    # HTML file and commit it to docs/ - the workflow publishes docs/ to
-    # GitHub Pages so it's viewable from any device/browser, no extension
-    # or Cowork session required.
     print("Rendering static dashboard HTML...")
     dashboard_html = render_dashboard_html(
         today, grade_data, grade_changes, range_statuses, flags_by_grade,
