@@ -49,7 +49,12 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CoffeeBriefingBot/1.0)"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 PRICE_LOG_HEADERS = [
     "Date", "Variety", "Grade", "Price Low (Rs/50kg)", "Price High (Rs/50kg)",
@@ -220,12 +225,22 @@ def fetch_ice_arabica_benchmark():
 
 
 def fetch_rate(from_ccy, to_ccy):
-    html = http_get(f"https://www.xe.com/currencyconverter/convert/?Amount=1&From={from_ccy}&To={to_ccy}")
+    """Uses the Frankfurter API (frankfurter.app - free, no key, ECB reference
+    rates), which returns plain JSON. xe.com's converter page is a
+    client-rendered React app: the actual rate number only appears after
+    JavaScript runs in a real browser, so a plain requests.get() never saw it
+    in the raw HTML - the old regex-on-xe.com approach was silently returning
+    None on every single run, not just failing today."""
+    html = http_get(f"https://api.frankfurter.app/latest?from={from_ccy}&to={to_ccy}")
     if not html:
         return None
-    m = re.search(rf"1\.00 {from_ccy} = ([\d.]+) {to_ccy}", html)
-    return float(m.group(1)) if m else None
-
+    try:
+        data = json.loads(html)
+        rate = data.get("rates", {}).get(to_ccy)
+        return float(rate) if rate is not None else None
+    except (ValueError, TypeError) as e:
+        print(f"  [warn] could not parse FX response for {from_ccy}->{to_ccy}: {e}")
+        return None
 
 # --------------------------------------------------------------------------
 # Google Sheets
