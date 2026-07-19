@@ -175,7 +175,41 @@ def fetch_kirehalli():
               f"(tried today {today.isoformat()} and yesterday, with -2/-3 suffixes)")
         return {}
 
-    text = BeautifulSoup(post_html, "html.parser").get_text("\n")def fetch_ice_arabica_benchmark():
+    text = BeautifulSoup(post_html, "html.parser").get_text("\n")
+
+    result = {"source_url": link}
+
+    def find_range(label):
+        m = re.search(rf"{label}.*?Rs\s*([\d,]+)\s*[–-]\s*(?:Rs\s*)?([\d,]+)",
+                      text, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return None, None
+        return int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
+
+    def find_change(label):
+        m = re.search(rf"{label}.*?(No Change|▲\s*\+?Rs\s*[\d,]+|▼\s*-?Rs\s*[\d,]+)",
+                      text, re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    result["arabica_parchment"] = find_range("Arabica Parchment")
+    result["arabica_parchment_chg"] = find_change("Arabica Parchment")
+    result["arabica_cherry"] = find_range("Arabica Cherry")
+    result["arabica_cherry_chg"] = find_change("Arabica Cherry")
+    result["robusta_parchment"] = find_range("Robusta Parchment")
+    result["robusta_parchment_chg"] = find_change("Robusta Parchment")
+    result["robusta_cherry"] = find_range("Robusta Cherry")
+    result["robusta_cherry_chg"] = find_change("Robusta Cherry")
+
+    m = re.search(r"arabica coffee.*?([\d]+\.[\d]+)\s*(?:US\s*)?cents?/lb", text, re.IGNORECASE)
+    result["ice_arabica_cents_lb"] = float(m.group(1)) if m else None
+
+    m = re.search(r"robusta coffee.*?US\$?\s*([\d,]+)\s*/?\s*tonne", text, re.IGNORECASE)
+    result["ice_robusta_usd_tonne"] = float(m.group(1).replace(",", "")) if m else None
+
+    return result
+
+
+def fetch_ice_arabica_benchmark():
     html = http_get("https://tradingeconomics.com/commodity/coffee")
     if not html:
         return None
