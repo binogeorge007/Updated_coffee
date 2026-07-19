@@ -143,58 +143,39 @@ def http_get(url, timeout=15):
 
 
 def fetch_kirehalli():
-    """Find the latest Kirehalli 'Coffee Prices (Karnataka)' post and parse it."""
-    html = http_get("https://kirehalli.com/coffee-prices-daily/")
-    if not html:
-        return {}
-    soup = BeautifulSoup(html, "html.parser")
+    """Fetches Kirehalli's latest 'Coffee Prices (Karnataka)' post directly by
+    its dated URL (kirehalli.com/coffee-prices-karnataka-DD-MM-YYYY), which is
+    their actual publishing pattern - sometimes with a -2/-3 suffix if they
+    post a same-day correction/update. Tries today's date (with suffixes)
+    first, then falls back to yesterday's date in case today's post isn't up
+    yet. Does NOT rely on finding a link from an index page - that approach
+    doesn't match how Kirehalli's site is actually structured and silently
+    found nothing. If no post is found at any candidate URL, returns {} and
+    every grade is logged as N/A rather than fabricating a number."""
+    today = datetime.date.today()
+    candidates = []
+    for days_back in (0, 1):
+        d = today - datetime.timedelta(days=days_back)
+        date_str = d.strftime("%d-%m-%Y")
+        candidates.append(f"https://kirehalli.com/coffee-prices-karnataka-{date_str}")
+        candidates.append(f"https://kirehalli.com/coffee-prices-karnataka-{date_str}-2")
+        candidates.append(f"https://kirehalli.com/coffee-prices-karnataka-{date_str}-3")
+
+    post_html = None
     link = None
-    for a in soup.find_all("a", href=True):
-        if "coffee-prices-karnataka" in a["href"]:
-            link = a["href"]
+    for url in candidates:
+        html = http_get(url)
+        if html:
+            post_html = html
+            link = url
             break
-    if not link:
-        print("  [warn] could not find a Kirehalli post link")
-        return {}
 
-    post_html = http_get(link)
     if not post_html:
+        print(f"  [warn] no Kirehalli post found at any of {len(candidates)} candidate URLs "
+              f"(tried today {today.isoformat()} and yesterday, with -2/-3 suffixes)")
         return {}
-    text = BeautifulSoup(post_html, "html.parser").get_text("\n")
 
-    result = {"source_url": link}
-
-    def find_range(label):
-        m = re.search(rf"{label}.*?Rs\s*([\d,]+)\s*[–-]\s*(?:Rs\s*)?([\d,]+)",
-                      text, re.IGNORECASE | re.DOTALL)
-        if not m:
-            return None, None
-        return int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
-
-    def find_change(label):
-        m = re.search(rf"{label}.*?(No Change|▲\s*\+?Rs\s*[\d,]+|▼\s*-?Rs\s*[\d,]+)",
-                      text, re.IGNORECASE | re.DOTALL)
-        return m.group(1).strip() if m else ""
-
-    result["arabica_parchment"] = find_range("Arabica Parchment")
-    result["arabica_parchment_chg"] = find_change("Arabica Parchment")
-    result["arabica_cherry"] = find_range("Arabica Cherry")
-    result["arabica_cherry_chg"] = find_change("Arabica Cherry")
-    result["robusta_parchment"] = find_range("Robusta Parchment")
-    result["robusta_parchment_chg"] = find_change("Robusta Parchment")
-    result["robusta_cherry"] = find_range("Robusta Cherry")
-    result["robusta_cherry_chg"] = find_change("Robusta Cherry")
-
-    m = re.search(r"arabica coffee.*?([\d]+\.[\d]+)\s*(?:US\s*)?cents?/lb", text, re.IGNORECASE)
-    result["ice_arabica_cents_lb"] = float(m.group(1)) if m else None
-
-    m = re.search(r"robusta coffee.*?US\$?\s*([\d,]+)\s*/?\s*tonne", text, re.IGNORECASE)
-    result["ice_robusta_usd_tonne"] = float(m.group(1).replace(",", "")) if m else None
-
-    return result
-
-
-def fetch_ice_arabica_benchmark():
+    text = BeautifulSoup(post_html, "html.parser").get_text("\n")def fetch_ice_arabica_benchmark():
     html = http_get("https://tradingeconomics.com/commodity/coffee")
     if not html:
         return None
