@@ -1,0 +1,69 @@
+name: Refresh Coffee Dashboard (Market Close Times)
+
+# ICE Arabica (New York) and ICE Robusta (London) settle at different times
+# of day, so a single fixed daily run is always stale for at least one of
+# them. This workflow runs refresh_dashboard.py twice, timed after each
+# exchange's approximate close, to keep the dashboard's global-benchmark
+# numbers current without waiting for the next coffee_briefing.py run.
+#
+# Cron times below are UTC and approximate - GitHub Actions cron does not
+# shift for daylight saving, so these drift up to an hour off the real
+# close twice a year:
+#   - ICE Robusta (London) close ~17:30 local (16:30 UTC in BST / 17:30 UTC
+#     in GMT) - the 18:00 UTC run below gives buffer in both cases.
+#   - ICE Arabica (New York) close ~13:00 local (17:00 UTC in EDT / 18:00
+#     UTC in EST) - the 19:00 UTC run below gives buffer in both cases.
+# Adjust the two cron lines in Nov/March if you want tighter alignment.
+#
+# This does not append new Sheet rows or send any notification - dashboard
+# only. See refresh_dashboard.py for the full explanation of what it does
+# and its limitations (Kirehalli bundles both ICE prices into one post, so
+# there is no truly independent live Robusta feed).
+
+on:
+  schedule:
+    - cron: "0 18 * * *"   # ~after ICE Robusta (London) close
+    - cron: "0 19 * * *"   # ~after ICE Arabica (New York) close
+  workflow_dispatch: {}    # trigger manually from the Actions tab any time
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh dashboard from latest market data
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python refresh_dashboard.py
+
+      - name: Upload dashboard as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
