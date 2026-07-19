@@ -1,0 +1,53 @@
+name: Daily Coffee Briefing
+
+on:
+  schedule:
+    # 9:00 AM UTC daily. Adjust if you want a different UTC trigger time -
+    # GitHub Actions cron is always UTC, it does not follow your local time
+    # or daylight saving.
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run coffee briefing
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python coffee_briefing.py
+        # Dashboard only - no Telegram/email secrets needed. This writes
+        # docs/index.html and appends today's row to the Google Sheet.
+
+      - name: Upload dashboard as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
