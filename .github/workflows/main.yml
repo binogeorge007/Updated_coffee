@@ -1,5 +1,5 @@
 name: Daily Coffee Briefing
-
+ 
 on:
   schedule:
     # 9:00 AM UTC daily. Adjust if you want a different UTC trigger time -
@@ -7,16 +7,17 @@ on:
     # or daylight saving.
     - cron: "0 9 * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
-
+ 
 permissions:
   contents: read
   pages: write
   id-token: write
-
+  actions: write   # needed by the keepalive job below
+ 
 concurrency:
   group: "pages"
   cancel-in-progress: false
-
+ 
 jobs:
   briefing:
     runs-on: ubuntu-latest
@@ -26,15 +27,15 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-
+ 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
+ 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+ 
       - name: Run coffee briefing
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -42,12 +43,24 @@ jobs:
         run: python coffee_briefing.py
         # Dashboard only - no Telegram/email secrets needed. This writes
         # docs/index.html and appends today's row to the Google Sheet.
-
+ 
       - name: Upload dashboard as Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
-
+ 
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+ 
+  # GitHub auto-disables scheduled workflows after 60 days with no commits
+  # to the repo. This job keeps the schedule alive so the daily run doesn't
+  # silently stop again (which is what happened on 17 Sep 2026).
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: liskin/gh-workflow-keepalive@v1
+ 
+
+
